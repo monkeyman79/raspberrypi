@@ -1,0 +1,209 @@
+diff --git a/arch/arm/Kconfig b/arch/arm/Kconfig
+index b5d529f..7c17234 100644
+--- a/arch/arm/Kconfig
++++ b/arch/arm/Kconfig
+@@ -1461,6 +1461,13 @@ config HOTPLUG_CPU
+ 	  Say Y here to experiment with turning CPUs off and on.  CPUs
+ 	  can be controlled through /sys/devices/system/cpu.
+ 
++config SMP_STEALTH_DISCO
++	bool "Allow starting offline CPUs with aritrary code"
++	depends on SMP
++	help
++	  Enable functions which allow running arbitrary code on offline
++	  CPUs behind kernel's back.
++
+ config ARM_PSCI
+ 	bool "Support for the ARM Power State Coordination Interface (PSCI)"
+ 	depends on HAVE_ARM_SMCCC
+diff --git a/arch/arm/include/asm/smp.h b/arch/arm/include/asm/smp.h
+index 3d6dc8b..ec3dced 100644
+--- a/arch/arm/include/asm/smp.h
++++ b/arch/arm/include/asm/smp.h
+@@ -65,7 +65,12 @@ struct secondary_data {
+ 	};
+ 	unsigned long swapper_pg_dir;
+ 	void *stack;
++#ifdef CONFIG_SMP_STEALTH_DISCO
++	void (*stealth_entry)(void*);
++	void *stealth_data;
++#endif
+ };
++
+ extern struct secondary_data secondary_data;
+ extern volatile int pen_release;
+ extern void secondary_startup(void);
+@@ -124,4 +129,9 @@ struct of_cpu_method {
+  */
+ extern void smp_set_ops(const struct smp_operations *);
+ 
++#ifdef CONFIG_SMP_STEALTH_DISCO
++int start_stealth_disco(unsigned int cpu, void (*entry)(void*), void* data);
++int stop_stealth_disco(unsigned int cpu);
++#endif
++
+ #endif /* ifndef __ASM_ARM_SMP_H */
+diff --git a/arch/arm/kernel/head.S b/arch/arm/kernel/head.S
+index 04286fd..ee9aa7e 100644
+--- a/arch/arm/kernel/head.S
++++ b/arch/arm/kernel/head.S
+@@ -418,6 +418,14 @@ ENDPROC(secondary_startup_arm)
+ ENTRY(__secondary_switched)
+ 	ldr	sp, [r7, #12]			@ get secondary_data.stack
+ 	mov	fp, #0
++#ifdef CONFIG_SMP_STEALTH_DISCO
++	ldr	r0, [r7, #16]			@ secondary_data.stealth_entry
++	cmp	r0, #0
++	beq	1f
++	ldr	r1, [r7, #20]			@ secondary_data.stealth_data
++	b	secondary_start_stealth
++1:
++#endif
+ 	b	secondary_start_kernel
+ ENDPROC(__secondary_switched)
+ 
+diff --git a/arch/arm/kernel/smp.c b/arch/arm/kernel/smp.c
+index 7dd14e8..1f32f17 100644
+--- a/arch/arm/kernel/smp.c
++++ b/arch/arm/kernel/smp.c
+@@ -146,6 +146,140 @@ int __cpu_up(unsigned int cpu, struct task_struct *idle)
+ 	return ret;
+ }
+ 
++#ifdef CONFIG_SMP_STEALTH_DISCO
++struct task_struct* idle_thread_get(unsigned int);
++
++int start_stealth_disco(unsigned int cpu, void (*entry)(void*), void* data)
++{
++	int ret;
++	struct task_struct* idle;
++
++	if (!smp_ops.smp_boot_secondary)
++		return -ENOSYS;
++
++	if (!cpu_present(cpu)) {
++		pr_err("CPU%u: not present\n", cpu);
++		return -ENXIO;
++	}
++
++	if (cpu_online(cpu)) {
++		pr_err("CPU%u: already online\n", cpu);
++		return -EBUSY;
++	}
++
++	idle = idle_thread_get(cpu);
++	if (idle == NULL) {
++		pr_err("CPU%u: idle thread not present\n", cpu);
++		return -ENXIO;
++	}
++
++	/*
++	 * We need to tell the secondary core where to find
++	 * its stack and the page tables.
++	 */
++	secondary_data.stack = task_stack_page(idle) + THREAD_START_SP;
++	secondary_data.stealth_entry = entry;
++	secondary_data.stealth_data = data;
++#ifdef CONFIG_ARM_MPU
++	secondary_data.mpu_rgn_szr = mpu_rgn_info.rgns[MPU_RAM_REGION].drsr;
++#endif
++
++#ifdef CONFIG_MMU
++	secondary_data.pgdir = virt_to_phys(idmap_pgd);
++	secondary_data.swapper_pg_dir = get_arch_pgd(swapper_pg_dir);
++#endif
++	sync_cache_w(&secondary_data);
++
++	irq_lock_sparse();
++
++	/*
++	 * Now bring the CPU into our world.
++	 */
++	ret = smp_ops.smp_boot_secondary(cpu, idle);
++	if (ret == 0) {
++		wait_for_completion_timeout(&cpu_running,
++						 msecs_to_jiffies(1000));
++	}
++	else {
++		pr_err("CPU%u: failed to start in stealth disco mode: %d\n", cpu, ret);
++	}
++
++	irq_unlock_sparse();
++
++	memset(&secondary_data, 0, sizeof(secondary_data));
++	return ret;
++}
++EXPORT_SYMBOL(start_stealth_disco);
++
++int stop_stealth_disco(unsigned int cpu)
++{
++	struct mm_struct *mm = &init_mm;
++	cpumask_clear_cpu(cpu, mm_cpumask(mm));
++
++	atomic_dec(&mm->mm_count);
++
++	flush_cache_louis();
++
++	if (!smp_ops.cpu_die)
++		return -ENOSYS;
++
++	smp_ops.cpu_die(cpu);
++
++	return -EIO;
++}
++EXPORT_SYMBOL(stop_stealth_disco);
++
++static void smp_store_cpu_info(unsigned int cpuid);
++
++asmlinkage void secondary_start_stealth(void (*entry)(void*), void* data)
++{
++	struct mm_struct *mm = &init_mm;
++	int cpu;
++
++	/*
++	 * The identity mapping is uncached (strongly ordered), so
++	 * switch away from it before attempting any exclusive accesses.
++	 */
++	cpu_switch_mm(mm->pgd, mm);
++	local_flush_bp_all();
++	enter_lazy_tlb(mm, current);
++	local_flush_tlb_all();
++
++	/*
++	 * All kernel threads share the same mm context; grab a
++	 * reference and switch to it.
++	 */
++	cpu = smp_processor_id();
++	atomic_inc(&mm->mm_count);
++	current->active_mm = mm;
++	cpumask_set_cpu(cpu, mm_cpumask(mm));
++
++	cpu_init();
++
++	pr_notice("CPU%u: Starting stealth disco\n", cpu);
++
++	preempt_disable();
++	trace_hardirqs_off();
++
++	/*
++	 * Give the platform a chance to do its own initialisation.
++	 */
++	if (smp_ops.smp_secondary_init)
++		smp_ops.smp_secondary_init(cpu);
++
++	calibrate_delay();
++
++	smp_store_cpu_info(cpu);
++
++	complete(&cpu_running);
++
++	entry(data);
++	
++	stop_stealth_disco(cpu);
++}
++
++#endif
++
+ /* platform specific SMP operations */
+ void __init smp_init_cpus(void)
+ {
